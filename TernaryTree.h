@@ -9,6 +9,10 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <istream>
+#include <locale>
+#include <sstream>
+#include <iomanip>
 
 template <typename T> class TernaryTree;
 
@@ -97,8 +101,8 @@ private:
     }
 
     template <typename Pointer>
-    static Node<T>* FindNode(Node<T>* subtree, const T& value) {
-        for (Node<T>* node = subtree; node; node = NextPreorder(node, subtree)) {
+    static Pointer FindNode(Pointer subtree, const T& value) {
+        for (Pointer node = subtree; node; node = NextPreorder(node, subtree)) {
             if (node->value == value) {
                 return node;
             }
@@ -281,7 +285,7 @@ private:
         const Node<T>* a = first;
         const Node<T>* b = second;
         while (a && b) {
-            if (a->value != b->value) {
+            if (!(a->value == b->value)) {
                 return false;
             }
             for (size_t i = 0; i < 3; ++i) {
@@ -313,6 +317,96 @@ private:
         parent->children[slot] = new Node<T>(value, parent);
         ++size;
     }
+
+    static std::string EncodeValue(const T& value) {
+        if constexpr (std::is_same_v<T, std::string>) {
+            return value;
+        } else {
+            std::ostringstream stream;
+            stream.imbue(std::locale::classic());
+            stream << std::setprecision(std::numeric_limits<long double>::max_digits10)
+                   << value;
+            if (!stream) throw std::invalid_argument("Cannot encode value");
+            return stream.str();
+        }
+    }
+
+    static T DecodeValue(std::string_view text) {
+        if constexpr (std::is_same_v<T, std::string>) {
+            return std::string(text);
+        } else if constexpr (std::is_same_v<T, char> ||
+                             std::is_same_v<T, signed char> ||
+                             std::is_same_v<T, unsigned char>) {
+            if (text.size() != 1) throw std::invalid_argument("Invalid character value");
+            return static_cast<T>(text[0]);
+        } else {
+            std::istringstream stream{std::string(text)};
+            stream.imbue(std::locale::classic());
+            T value{};
+            if (!(stream >> value)) throw std::invalid_argument("Cannot decode value");
+            stream >> std::ws;
+            if (!stream.eof()) throw std::invalid_argument("Unexpected characters in value");
+            return value;
+        }
+    }
+
+    static std::string_view ReadPayload(std::string_view text, size_t& pos) {
+        size_t length = 0;
+        const size_t begin = pos;
+        while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+            const size_t digit = static_cast<size_t>(text[pos++] - '0');
+            if (length > (std::numeric_limits<size_t>::max() - digit) / 10) {
+                throw std::invalid_argument("Value length overflow");
+            }
+            length = length * 10 + digit;
+        }
+        if (pos == begin || pos == text.size() || text[pos++] != ':') {
+            throw std::invalid_argument("Expected length:value");
+        }
+        if (length > text.size() - pos) throw std::invalid_argument("Truncated value");
+        const std::string_view payload = text.substr(pos, length);
+        pos += length;
+        return payload;
+    }
+
+    struct ParseFrame {
+        ParseFrame* parent;
+        size_t slot;
+        size_t stage = 0;
+        Node<T>* node = nullptr;
+        Node<T>* pending[3] = {nullptr, nullptr, nullptr};
+
+        ParseFrame(ParseFrame* parentFrame = nullptr, size_t childSlot = 0) : parent(parentFrame), slot(childSlot) {}
+
+        ~ParseFrame() {
+            Destroy(node);
+            for (Node<T>* child : pending) {
+                Destroy(child);
+            }
+        }
+
+        void StoreChild(size_t childSlot, Node<T>* child) noexcept {
+            if (node) {
+                node->children[childSlot] = child;
+                if (child) {
+                    child->parent = node;
+                }
+            } else {
+                pending[childSlot] = child;
+            }
+        }
+
+        void StoreNode(Node<T>* newNode) {
+            node = newNode;
+            for (size_t i = 0; i < 3; ++i) {
+                node->children[i] = pending[i];
+                if (pending[i]) {
+                    pending[i]->parent = node;
+                }
+                pending[i] = nullptr;
+            }
+        }
+    };
 
 public:
     TernaryTree() : root(nullptr), size(0) {}
@@ -362,12 +456,16 @@ public:
         size = 0;
     }
 
-    bool Empty() { return root == nullptr; }
+    bool Empty() const { return root == nullptr; }
 
-    size_t Size() { return size; }
+    size_t Size() const { return size; }
 
     T& GetRoot() { return At(""); }
     const T& GetRoot() const { return At(""); }
+
+    T& SetRoot(const T& value) { return SetRootImpl(value); }
+
+    T& SetRoot(T&& value) { return SetRootImpl(std::move(value)); }
 
     T& Insert(std::string_view parentPath, size_t childNumber, const T& value) {
         return InsertImpl(parentPath, childNumber, value);
@@ -375,6 +473,15 @@ public:
 
     T& At(std::string_view path) { return Resolve(root, path)->value; }
     const T& At(std::string_view path) const { return Resolve(static_cast<const Node<T>*>(root), path)->value; }
+
+    T& AtRelative(std::string_view startPath, std::string_view relativePath) {
+        return Resolve(Resolve(root, startPath), relativePath, true)->value;
+    }
+
+    const T& AtRelative(std::string_view startPath, std::string_view relativePath) const {
+        const Node<T>* start = Resolve(static_cast<const Node<T>*>(root), startPath);
+        return Resolve(start, relativePath, true)->value;
+    }
 
     T* Find(const T& value) {
         Node<T>* found = FindNode(root, value);
@@ -434,6 +541,33 @@ public:
         return result;
     }
 
+    TernaryTree ExtractSubtree(const T& value) const {
+        const Node<T>* found = FindNode(static_cast<const Node<T>*>(root), value);
+        if (!found) {
+            throw std::out_of_range("Value does not exist");
+        }
+        return CopySubtree(found);
+    }
+
+    TernaryTree ExtractSubtreeAt(std::string_view path) const {
+        return CopySubtree(Resolve(static_cast<const Node<T>*>(root), path));
+    }
+
+    bool ContainsSubtree(const TernaryTree& subtree) const {
+        if (subtree.Empty()) {
+            return true;
+        }
+        if (subtree.size > size) {
+            return false;
+        }
+        const Node<T>* boundary = root;
+        for (const Node<T>* node = root; node; node = NextPreorder(node, boundary)) {
+            if (Equal(node, subtree.root)) return true;
+        }
+        return false;
+    }
+
+
     bool operator==(const TernaryTree& other) const {
         return size == other.size && Equal(root, other.root);
     }
@@ -455,6 +589,84 @@ public:
         size += copy.size;
         copy.root = nullptr;
         copy.size = 0;
+    }
+
+    template <typename Encoder>
+    std::string ToStringWith(Encoder&& encoder, std::string_view order = "K123") const {
+        std::string result;
+        Walk(static_cast<const Node<T>*>(root), ParseOrder(order),
+             [&](const Node<T>* node, Event event) {
+                 if (event == Open) result.push_back('(');
+                 else if (event == Close) result.push_back(')');
+                 else if (event == Null) result.push_back('#');
+                 else {
+                     const std::string payload = encoder(node->value);
+                     result += std::to_string(payload.size());
+                     result.push_back(':');
+                     result += payload;
+                 }
+                 return true;
+             });
+        return result;
+    }
+
+    std::string ToString(std::string_view order = "K123") const {
+        return ToStringWith([](const T& value) { return EncodeValue(value); }, order);
+    }
+
+
+    template <typename Decoder>
+    static TernaryTree FromStringWith(std::string_view text, Decoder&& decoder, std::string_view order = "K123") {
+        const Order parsedOrder = ParseOrder(order);
+        TernaryTree result;
+        if (text == "#") return result;
+        if (text.empty() || text[0] != '(') {
+            throw std::invalid_argument("Expected a node or #");
+        }
+        size_t pos = 1;
+        ParseFrame* frame = new ParseFrame;
+        try {
+            while (frame) {
+                if (frame->stage == 4) {
+                    if (pos == text.size() || text[pos++] != ')') {
+                        throw std::invalid_argument("Expected closing parenthesis");
+                    }
+                    Node<T>* completed = frame->node;
+                    frame->node = nullptr;
+                    const size_t slot = frame->slot;
+                    ParseFrame* parent = frame->parent;
+                    delete frame;
+                    frame = parent;
+                    if (frame) frame->StoreChild(slot, completed);
+                    else result.root = completed;
+                } else {
+                    const int token = parsedOrder[frame->stage++];
+                    if (token == 0) {
+                        const std::string_view payload = ReadPayload(text, pos);
+                        frame->StoreNode(new Node<T>(decoder(payload)));
+                        ++result.size;
+                    } else {
+                        if (pos == text.size()) throw std::invalid_argument("Truncated tree");
+                        const char c = text[pos++];
+                        if (c == '(') frame = new ParseFrame(frame, token - 1);
+                        else if (c != '#') throw std::invalid_argument("Expected a child or #");
+                    }
+                }
+            }
+            if (pos != text.size()) throw std::invalid_argument("Unexpected trailing characters");
+        } catch (...) {
+            while (frame) {
+                ParseFrame* parent = frame->parent;
+                delete frame;
+                frame = parent;
+            }
+            throw;
+        }
+        return result;
+    }
+
+    static TernaryTree FromString(std::string_view text, std::string_view order = "K123") { 
+        return FromStringWith(text, [](std::string_view payload) { return DecodeValue(payload); }, order); 
     }
 };
 
