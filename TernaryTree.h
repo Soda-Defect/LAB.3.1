@@ -13,6 +13,8 @@
 #include <locale>
 #include <sstream>
 #include <iomanip>
+#include <memory>
+#include <unordered_map>
 
 template <typename T> class TernaryTree;
 
@@ -369,6 +371,100 @@ private:
         return payload;
     }
 
+    struct FormatSpec {
+        Order order{};
+        std::array<std::string, 5> literals{};
+    };
+
+    static FormatSpec ParseFormat(std::string_view format) {
+        FormatSpec result;
+        bool seen[4] = {false, false, false, false};
+        size_t field = 0;
+        for (size_t pos = 0; pos < format.size();) {
+            const char c = format[pos];
+            if (c == '\\') {
+                if (++pos == format.size()) {
+                    throw std::invalid_argument("Incomplete format escape");
+                }
+                result.literals[field].push_back(format[pos++]);
+                continue;
+            }
+            int token = -1;
+            size_t width = 1;
+            if (c == 'K') {
+                token = 0;
+            } else if (c >= '1' && c <= '3') {
+                token = c - '0';
+            } else if (static_cast<unsigned char>(c) == 0xD0 &&
+                       pos + 1 < format.size() &&
+                       static_cast<unsigned char>(format[pos + 1]) == 0x9A) {
+                token = 0; 
+                width = 2;
+            }
+            if (token < 0) {
+                result.literals[field].push_back(c);
+            } else {
+                if (field == 4 || seen[token]) {
+                    throw std::invalid_argument("Format repeats a tree field");
+                }
+                seen[token] = true;
+                result.order[field++] = token;
+            }
+            pos += width;
+        }
+        if (field != 4) {
+            throw std::invalid_argument("Format must contain K, 1, 2 and 3 exactly once");
+        }
+        if ((!result.literals[0].empty() && result.literals[0][0] == '#') || (result.literals[0].empty() && result.order[0] != 0)) {
+            throw std::invalid_argument("Ambiguous format: use an opening delimiter or start with K");
+        }
+        return result;
+    }
+
+    static void ReadLiteral(std::string_view text, size_t& pos, std::string_view literal) {
+        if (literal.size() > text.size() - pos ||
+            text.compare(pos, literal.size(), literal) != 0) {
+            throw std::invalid_argument("Text does not match the formatting string");
+        }
+        pos += literal.size();
+    }
+
+    static size_t ReadListNumber(std::string_view text, size_t& pos) {
+        const size_t begin = pos;
+        size_t result = 0;
+        while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+            const size_t digit = static_cast<size_t>(text[pos++] - '0');
+            if (result > (std::numeric_limits<size_t>::max() - digit) / 10) {
+                throw std::invalid_argument("List number overflow");
+            }
+            result = result * 10 + digit;
+        }
+        if (pos == begin) {
+            throw std::invalid_argument("Expected an unsigned list number");
+        }
+        return result;
+    }
+
+    static void ReadListSpace(std::string_view text, size_t& pos, bool required) {
+        const size_t begin = pos;
+        while (pos < text.size()) {
+            const char c = text[pos];
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '\v' && c != '\f') {
+                break;
+            }
+            ++pos;
+        }
+        if (required && pos == begin) {
+            throw std::invalid_argument("Expected whitespace between list fields");
+        }
+    }
+
+    struct ParentRecord {
+        std::unique_ptr<Node<T>> node;
+        size_t parent = 0;
+        size_t childNumber = 0;
+    };
+
     struct ParseFrame {
         ParseFrame* parent;
         size_t slot;
@@ -667,6 +763,186 @@ public:
 
     static TernaryTree FromString(std::string_view text, std::string_view order = "K123") { 
         return FromStringWith(text, [](std::string_view payload) { return DecodeValue(payload); }, order); 
+    }
+
+    template <typename Encoder>
+    std::string ToStringFormatWith(std::string_view format, Encoder&& encoder) const {
+        const FormatSpec spec = ParseFormat(format);
+        if (!root) return "#";
+        std::string result;
+        const Node<T>* node = root;
+        size_t stage = 0;
+        while (true) {
+            result += spec.literals[stage];
+            if (stage == 4) {
+                if (node == root) break;
+                const int token = static_cast<int>(ChildIndex(node)) + 1;
+                node = node->parent;
+                stage = 0;
+                while (spec.order[stage] != token) ++stage;
+                ++stage;
+            } else {
+                const int token = spec.order[stage++];
+                if (token == 0) {
+                    const std::string payload = encoder(node->value);
+                    result += std::to_string(payload.size());
+                    result.push_back(':');
+                    result += payload;
+                } else if (node->children[token - 1]) {
+                    node = node->children[token - 1];
+                    stage = 0;
+                } else {
+                    result.push_back('#');
+                }
+            }
+        }
+        return result;
+    }
+
+    std::string ToStringFormat(std::string_view format) const {
+        return ToStringFormatWith(format, [](const T& value) { return EncodeValue(value); });
+    }
+
+    template <typename Decoder>
+    static TernaryTree FromStringFormatWith(std::string_view text, std::string_view format,
+                                            Decoder&& decoder) {
+        const FormatSpec spec = ParseFormat(format);
+        TernaryTree result;
+        if (text == "#") return result;
+        size_t pos = 0;
+        ParseFrame* frame = new ParseFrame;
+        try {
+            while (frame) {
+                ReadLiteral(text, pos, spec.literals[frame->stage]);
+                if (frame->stage == 4) {
+                    Node<T>* completed = frame->node;
+                    frame->node = nullptr;
+                    const size_t slot = frame->slot;
+                    ParseFrame* parent = frame->parent;
+                    delete frame;
+                    frame = parent;
+                    if (frame) frame->StoreChild(slot, completed);
+                    else result.root = completed;
+                } else {
+                    const int token = spec.order[frame->stage++];
+                    if (token == 0) {
+                        const std::string_view payload = ReadPayload(text, pos);
+                        frame->StoreNode(new Node<T>(decoder(payload)));
+                        ++result.size;
+                    } else {
+                        if (pos == text.size()) throw std::invalid_argument("Truncated formatted tree");
+                        if (text[pos] == '#') ++pos;
+                        else frame = new ParseFrame(frame, static_cast<size_t>(token - 1));
+                    }
+                }
+            }
+            if (pos != text.size()) throw std::invalid_argument("Unexpected trailing characters");
+        } catch (...) {
+            while (frame) {
+                ParseFrame* parent = frame->parent;
+                delete frame;
+                frame = parent;
+            }
+            throw;
+        }
+        return result;
+    }
+
+
+    static TernaryTree FromStringFormat(std::string_view text, std::string_view format) {
+        return FromStringFormatWith(text, format, [](std::string_view payload) { return DecodeValue(payload); });
+    }
+
+    template <typename Encoder>
+    std::string ToParentListWith(Encoder&& encoder) const {
+        std::string result = std::to_string(size) + '\n';
+        std::unordered_map<const Node<T>*, size_t> identifiers;
+        identifiers.reserve(size);
+        const Node<T>* boundary = root;
+        size_t id = 0;
+        for (const Node<T>* node = root; node; node = NextPreorder(node, boundary)) {
+            ++id;
+            const size_t parentId = node->parent ? identifiers.at(node->parent) : 0;
+            const size_t childNumber = node->parent ? ChildIndex(node) + 1 : 0;
+            const std::string payload = encoder(node->value);
+            result += std::to_string(id) + ' ' + std::to_string(parentId) + ' ' +
+                      std::to_string(childNumber) + ' ' + std::to_string(payload.size()) + ':';
+            result += payload;
+            result.push_back('\n');
+            identifiers.emplace(node, id);
+        }
+        return result;
+    }
+
+    std::string ToParentList() const { return ToParentListWith([](const T& value) { return EncodeValue(value); }); };
+
+    template <typename Decoder>
+    static TernaryTree FromParentListWith(std::string_view text, Decoder&& decoder) {
+        TernaryTree result;
+        size_t pos = 0;
+        ReadListSpace(text, pos, false);
+        const size_t count = ReadListNumber(text, pos);
+        if (count == 0) {
+            ReadListSpace(text, pos, false);
+            if (pos != text.size()) throw std::invalid_argument("Unexpected empty-list data");
+            return result;
+        }
+        if (count > text.size() || count == std::numeric_limits<size_t>::max()) {
+            throw std::invalid_argument("Node count does not match the list");
+        }
+        ReadListSpace(text, pos, true);
+        auto records = std::make_unique<ParentRecord[]>(count + 1);
+        size_t rootId = 0;
+        for (size_t row = 0; row < count; ++row) {
+            const size_t id = ReadListNumber(text, pos);
+            ReadListSpace(text, pos, true);
+            const size_t parentId = ReadListNumber(text, pos);
+            ReadListSpace(text, pos, true);
+            const size_t childNumber = ReadListNumber(text, pos);
+            ReadListSpace(text, pos, true);
+            const std::string_view payload = ReadPayload(text, pos);
+            if (id == 0 || id > count || parentId > count || records[id].node) {
+                throw std::invalid_argument("Invalid or duplicate node ID");
+            }
+            if (parentId == 0) {
+                if (childNumber != 0 || rootId != 0) {
+                    throw std::invalid_argument("List must have exactly one root with position 0");
+                }
+                rootId = id;
+            } else if (parentId == id || childNumber < 1 || childNumber > 3) {
+                throw std::invalid_argument("Invalid parent or child position");
+            }
+            records[id].node.reset(new Node<T>(decoder(payload)));
+            records[id].parent = parentId;
+            records[id].childNumber = childNumber;
+            ReadListSpace(text, pos, row + 1 < count);
+        }
+        if (pos != text.size() || rootId == 0) {
+            throw std::invalid_argument("Missing root or unexpected trailing list data");
+        }
+        for (size_t id = 1; id <= count; ++id) {
+            const size_t parentId = records[id].parent;
+            if (parentId == 0) continue;
+            Node<T>* parent = records[parentId].node.get();
+            const size_t slot = records[id].childNumber - 1;
+            if (parent->children[slot]) throw std::invalid_argument("Two nodes occupy one child slot");
+            parent->children[slot] = records[id].node.get();
+            records[id].node->parent = parent;
+        }
+        const Node<T>* boundary = records[rootId].node.get();
+        size_t visited = 0;
+        for (const Node<T>* node = boundary; node; node = NextPreorder(node, boundary)) {
+            if (++visited > count) throw std::invalid_argument("Cycle in parent list");
+        }
+        if (visited != count) throw std::invalid_argument("Parent list is disconnected or contains a cycle");
+        result.root = records[rootId].node.get();
+        result.size = count;
+        for (size_t id = 1; id <= count; ++id) records[id].node.release();
+        return result;
+    }
+
+    static TernaryTree FromParentList(std::string_view text) {
+        return FromParentListWith(text, [](std::string_view payload) { return DecodeValue(payload); });
     }
 };
 
